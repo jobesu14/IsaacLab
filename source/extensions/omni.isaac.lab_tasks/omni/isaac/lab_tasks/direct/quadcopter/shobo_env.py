@@ -3,6 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+# Launch training with the following command:
+# ./isaaclab.sh -p source/standalone/workflows/rl_games/train.py --task Isaac-Shobo-Direct-v0 --num_envs 4096 --headless
+
+# Launch inference with the following command:
+# ./isaaclab.sh -p source/standalone/workflows/rl_games/play.py --task Isaac-Shobo-Direct-v0 --num_envs 64
+
 from __future__ import annotations
 
 import gymnasium as gym
@@ -27,7 +33,7 @@ from omni.isaac.lab.markers import CUBOID_MARKER_CFG  # isort: skip
 
 
 class ShoboEnvWindow(BaseEnvWindow):
-    """Window manager for the Quadcopter environment."""
+    """Window manager for the Shobo environment."""
 
     def __init__(self, env: ShoboEnv, window_name: str = "IsaacLab"):
         """Initialize the window.
@@ -92,6 +98,7 @@ class ShoboEnvCfg(DirectRLEnvCfg):
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9
     moment_scale = 0.01
+    perturbation_amplitude = 0.0
 
     # reward scales
     lin_vel_reward_scale = -0.05
@@ -126,6 +133,12 @@ class ShoboEnv(DirectRLEnv):
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
+        
+        # Perturbation forces
+        self._perturbation_force = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self._perturbation_force_var = \
+            torch.zeros_like(self._perturbation_force, device=self.device).uniform_(-self.cfg.perturbation_amplitude,
+                                                                                    self.cfg.perturbation_amplitude)
 
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
@@ -146,11 +159,30 @@ class ShoboEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
+        # print(f"Actions shape: {self._actions.shape}")
+
+        # The thrust is applied in the z direction only, x,y remain 0
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
+        # The moment is applied in the x, y, z directions
         self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
+        # print(f"Thrust: {self._thrust[0, 0, 2]}, Moment: {self._moment[0, 0, :]}")
 
     def _apply_action(self):
-        self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
+        # PX4 has this relevant command to apply external forces and torques:
+        # https://github.com/PX4/px4_msgs/blob/main/msg/VehicleRatesSetpoint.msg
+
+        # Apply perturbation forces
+        self._perturbation_force += self._perturbation_force_var * self.step_dt
+        self._perturbation_force = torch.clamp(self._perturbation_force, -self.cfg.perturbation_amplitude,
+                                               self.cfg.perturbation_amplitude)
+        forces = self._thrust + self._perturbation_force
+        self._perturbation_force_var = torch.zeros_like(self._perturbation_force_var).uniform_(
+            -self.cfg.perturbation_amplitude, self.cfg.perturbation_amplitude)
+
+        # Set external force and torque to apply on the asset's bodies in their local frame.
+        # forces: External forces in bodies' local frame. Shape is (len(env_ids), len(body_ids), 3).
+        # torques: External torques in bodies' local frame. Shape is (len(env_ids), len(body_ids), 3).
+        self._robot.set_external_force_and_torque(forces, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
         desired_pos_b, _ = subtract_frame_transforms(
@@ -165,6 +197,7 @@ class ShoboEnv(DirectRLEnv):
             ],
             dim=-1,
         )
+        # print(f"Observation shape: {obs.shape}")
         observations = {"policy": obs}
         return observations
 
