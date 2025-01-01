@@ -15,6 +15,7 @@ import gymnasium as gym
 import torch
 
 import omni.isaac.lab.sim as sim_utils
+import omni.isaac.lab.utils.math as math_utils
 from omni.isaac.lab.assets import Articulation, ArticulationCfg
 from omni.isaac.lab.envs import DirectRLEnv, DirectRLEnvCfg
 from omni.isaac.lab.envs.ui import BaseEnvWindow
@@ -98,12 +99,15 @@ class ShoboEnvCfg(DirectRLEnvCfg):
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9
     moment_scale = 0.01
-    perturbation_amplitude = 0.0
+    wind_force_max = 0.0  # [N] -> apply an acceleration of a = F/m = 0.2/0.03 = 6.67 m/s^2
+    goal_motion_speed_max = 1.0  # [m/s]
 
     # reward scales
     lin_vel_reward_scale = -0.05
     ang_vel_reward_scale = -0.01
     distance_to_goal_reward_scale = 15.0
+    drone_flatness_reward_scale = 1.0
+    look_forward_reward_scale = 1.0
 
 
 class ShoboEnv(DirectRLEnv):
@@ -126,6 +130,8 @@ class ShoboEnv(DirectRLEnv):
                 "lin_vel",
                 "ang_vel",
                 "distance_to_goal",
+                "drone_flatness",
+                "look_forward"
             ]
         }
         # Get specific body indices
@@ -134,11 +140,12 @@ class ShoboEnv(DirectRLEnv):
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
         
-        # Perturbation forces
-        self._perturbation_force = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._perturbation_force_var = \
-            torch.zeros_like(self._perturbation_force, device=self.device).uniform_(-self.cfg.perturbation_amplitude,
-                                                                                    self.cfg.perturbation_amplitude)
+        # Environment modifications
+        self._wind_force = torch.zeros_like(self._thrust, device=self.device).uniform_(-self.cfg.wind_force_max,
+                                                                                       self.cfg.wind_force_max)
+        self._desired_pos_speed_w = \
+            torch.zeros_like(self._desired_pos_w, device=self.device).uniform_(-self.cfg.goal_motion_speed_max,
+                                                                               self.cfg.goal_motion_speed_max)
 
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
@@ -172,12 +179,11 @@ class ShoboEnv(DirectRLEnv):
         # https://github.com/PX4/px4_msgs/blob/main/msg/VehicleRatesSetpoint.msg
 
         # Apply perturbation forces
-        self._perturbation_force += self._perturbation_force_var * self.step_dt
-        self._perturbation_force = torch.clamp(self._perturbation_force, -self.cfg.perturbation_amplitude,
-                                               self.cfg.perturbation_amplitude)
-        forces = self._thrust + self._perturbation_force
-        self._perturbation_force_var = torch.zeros_like(self._perturbation_force_var).uniform_(
-            -self.cfg.perturbation_amplitude, self.cfg.perturbation_amplitude)
+        forces = self._thrust + self._wind_force
+        
+        # Move the goal position
+        self._desired_pos_w += self._desired_pos_speed_w * self.step_dt
+        self._desired_pos_w[:, 2] = torch.clamp(self._desired_pos_w[:, 2], 0.5, 10.0)
 
         # Set external force and torque to apply on the asset's bodies in their local frame.
         # forces: External forces in bodies' local frame. Shape is (len(env_ids), len(body_ids), 3).
@@ -206,10 +212,21 @@ class ShoboEnv(DirectRLEnv):
         ang_vel = torch.sum(torch.square(self._robot.data.root_com_ang_vel_b), dim=1)
         distance_to_goal = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_link_pos_w, dim=1)
         distance_to_goal_mapped = 1 - torch.tanh(distance_to_goal / 0.8)
+        drone_flatness = -self._robot.data.projected_gravity_b[:, 2]  # z component of the projected gravity is ideally -1
+
+        # Compute the look forward reward
+        # TODO: merge look_forward and flatness rewards by projecting the goal_dir_normalized into the xy plane for
+        # the look_forward, so that it encourages the drone to move towards the goal while being flat.
+        goal_dir_normalized = (self._desired_pos_w - self._robot.data.root_link_pos_w) / distance_to_goal[:, None]
+        forward_w_normalized = math_utils.quat_apply(self._robot.data.root_link_quat_w, self._robot.data.FORWARD_VEC_B)
+        look_forward = torch.sum(forward_w_normalized * goal_dir_normalized, dim=1)  # dot product
+
         rewards = {
             "lin_vel": lin_vel * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": ang_vel * self.cfg.ang_vel_reward_scale * self.step_dt,
             "distance_to_goal": distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
+            "drone_flatness": drone_flatness * self.cfg.drone_flatness_reward_scale * self.step_dt,
+            "look_forward": look_forward * self.cfg.look_forward_reward_scale * self.step_dt,
         }
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         # Logging
@@ -264,6 +281,15 @@ class ShoboEnv(DirectRLEnv):
         self._robot.write_root_link_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_com_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        
+        # Reset perturbation force
+        self._wind_force[env_ids] = torch.zeros_like(self._wind_force[env_ids]).uniform_(-self.cfg.wind_force_max,
+                                                                                         self.cfg.wind_force_max)
+        
+        # Reset goal motion speed
+        self._desired_pos_speed_w[env_ids] = torch.zeros_like(self._desired_pos_speed_w[env_ids]).uniform_(
+            -self.cfg.goal_motion_speed_max, self.cfg.goal_motion_speed_max
+        )
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first tome
